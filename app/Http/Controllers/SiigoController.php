@@ -199,6 +199,41 @@ public function uploadExcel(Request $request)
             'cost_center' => (int)$cost_center,
             'value' => (float)($r['COP'] ?? 0),
         ];
+
+
+        // --- versión alternativa más clara (igual que arriba, pero sin duplicar arrays)
+$creditItem = [
+    'account' => ['code' => $ventaAcc, 'movement' => 'Credit'],
+    'customer' => ['identification' => $defaultCustomerId],
+    'cost_center' => (int)$cost_center,
+    'product' => [
+        'code' => (string)$clas,
+        'name' => $r['Detalle'],
+        'quantity' => 0,
+        'description' => $r['Detalle'],
+        'value' => (float)($r['COP'] ?? 0),
+    ],
+    'description' => $r['Detalle'],
+    'value' => (float)($r['COP'] ?? 0),
+];
+
+$debitItem = [
+    'account' => ['code' => '13050501', 'movement' => 'Debit'],
+    'customer' => ['identification' => $defaultCustomerId],
+    'due' => [
+        'prefix' => 'C',
+        'consecutive' => 1,
+        'quote' => 1,
+        'date' => $dateManual,
+    ],
+    'description' => $r['Detalle'],
+    'cost_center' => (int)$cost_center,
+    'value' => (float)($r['COP'] ?? 0),
+];
+
+$itemsFacturaVentas[] = $creditItem;
+$itemsFacturaVentas[] = $debitItem;
+
     }
 
     // Si hay errores de validación, devuelve para que corrijas el Excel / configuración
@@ -293,35 +328,131 @@ if (!empty($itemsContable)) {
 
 // ------------------ loop para VENTAS (iddoc 31800) ------------------
 if (!empty($itemsFacturaVentas)) {
-    $chunksV = array_chunk($itemsFacturaVentas, max(1, $chunkSize));
-    Log::info("sendVentas -> total itemsFacturaVentas: ".count($itemsFacturaVentas)." chunks: ".count($chunksV));
-    
-    foreach ($chunksV as $i => $chunk) {
-        // Fix: Single loop, not nested, and preserve product field
-        foreach ($chunk as &$it) {
-            // aseguramos campos obligatorios - MANTENER el campo product
-            $it = [
-                'account'     => $it['account'],
-                'customer'    => $it['customer'] ?? null,
-                'product'     => $it['product'] ?? null, // <- CRITICAL: Keep product field
-                'value'       => $it['value'] ?? 0,
-                'description' => $it['description'] ?? '',
-                'cost_center' => $it['cost_center'] ?? null,
-                'due'         => $it['due'] ?? null,
-            ];
-        }
-        unset($it);
+             $chunksV = array_chunk($itemsFacturaVentas, max(1, $chunkSize));
+            Log::info("sendVentas -> total itemsFacturaVentas: ".count($itemsFacturaVentas)." chunks: ".count($chunksV));
 
-        $paramsVentas = [
-            'user' => $config->siigo_user,
-            'key'  => $config->siigo_key,
-            'data' => $chunk,
-            'date' => $dateManual,
-            'obs'  => $request->input('observations') ?? null,
-            'iddoc'=> 31800,
-            '_id'  => $operationId,
-            'reserve_number' => false,
+            // definir método de pago a usar en payments (evita Undefined variable $paymentId)
+$paymentId = (int)($request->input('payment_id') ?? ($config->medio_pago_default ?? 0));
+
+            foreach ($chunksV as $i => $chunk) {
+                // Normalize items for the chunk (ensure types)
+                $chunkOperationId = $operationId ? ($operationId . "_v{$i}") : ("ventas_{$i}_" . uniqid());
+
+$itemsForSiigo = [];
+$totalCredit = 0.0;
+$totalDebit = 0.0;
+
+foreach ($chunk as $rawItem) {
+    $customerObj = $rawItem['customer'] ?? ['identification' => $defaultCustomerId];
+
+    // Si viene product, determinamos quantity, unitValue y lineTotal
+    $quantity = 1;
+    $unitValue = isset($rawItem['product']['value']) ? (float)$rawItem['product']['value'] : (float)($rawItem['value'] ?? 0.0);
+    if (isset($rawItem['product']['quantity'])) {
+        $quantity = max(1, (int)$rawItem['product']['quantity']);
+    } elseif (isset($rawItem['quantity'])) {
+        $quantity = max(1, (int)$rawItem['quantity']);
+    }
+
+    // Si en tu fuente 'product.value' es total (no unitario), detectarlo:
+    // heurística: si product.value == rawItem.value and quantity>1 -> asumir que product.value es total
+    if ($quantity > 1 && isset($rawItem['product']['value']) && isset($rawItem['value'])) {
+        // preferimos tratar product.value como unitario si parece unitario; si no, calculamos unitario
+        if (abs((float)$rawItem['product']['value'] - (float)$rawItem['value']) > 0.01) {
+            // ninguno coincide exactamente -> usar product.value as unit
+            $unitValue = (float)$rawItem['product']['value'];
+        } else {
+            // coincide -> derive unit from total
+            $unitValue = ((float)$rawItem['product']['value']) / max(1, $quantity);
+        }
+    }
+
+    $lineTotal = round($unitValue * $quantity, 2);
+
+    // ITEM: producto (Credit) => incluir product con unitValue y quantity, pero value = lineTotal
+    if (!empty($rawItem['product']) && is_array($rawItem['product'])) {
+        $prod = $rawItem['product'];
+        $itemsForSiigo[] = [
+            'product' => [
+                'code' => (string)($prod['code'] ?? ''),
+                'name' => $prod['name'] ?? ($rawItem['description'] ?? 'Item'),
+                'quantity' => $quantity,
+                // enviamos unitario en product.value (si tu integración necesita unitario)
+                'value' => round($unitValue, 2),
+            ],
+            // este es el total de la línea
+            'value' => $lineTotal,
+            'account' => [
+                'code' => (string)($rawItem['account']['code'] ?? '41359518'),
+                'movement' => $rawItem['account']['movement'] ?? 'Credit'
+            ],
+            'cost_center' => isset($rawItem['cost_center']) ? (int)$rawItem['cost_center'] : (int)($config->centro_costos_default ?? 0),
+            'customer' => $customerObj,
+            'description' => $rawItem['description'] ?? ($prod['name'] ?? '')
         ];
+        $totalCredit += $lineTotal;
+    }
+
+    // ITEM: contrapartida (Debit) => usar el MISMO lineTotal (no el unitario)
+    if (!empty($rawItem['due'])) {
+        $itemsForSiigo[] = [
+            'value' => $lineTotal,
+            'account' => [
+                'code' => (string)($rawItem['account']['code'] ?? '13050501'),
+                'movement' => $rawItem['account']['movement'] ?? 'Debit'
+            ],
+            'cost_center' => isset($rawItem['cost_center']) ? (int)$rawItem['cost_center'] : (int)($config->centro_costos_default ?? 0),
+            'customer' => $customerObj,
+            'due' => [
+                'prefix' => $rawItem['due']['prefix'] ?? 'C',
+                'consecutive' => $rawItem['due']['consecutive'] ?? 1,
+                'quote' => $rawItem['due']['quote'] ?? 1,
+                'date' => $rawItem['due']['date'] ?? $dateManual
+            ],
+            'description' => $rawItem['description'] ?? ''
+        ];
+        $totalDebit += $lineTotal;
+    }
+}
+
+// DEBUG: log totals before send para confirmar balance
+Log::info("sendVentas chunk {$i} totals -> credit: {$totalCredit}, debit: {$totalDebit}, itemsCount: ".count($itemsForSiigo));
+
+// ahora paramsVentas (ENVIAR items, NO data)
+$paramsVentas = [
+    'iddoc' => 31800,
+    '_id' => $chunkOperationId,
+    'reserve_number' => false,
+    'document' => ['id' => 31800],
+    'date' => $dateManual,
+    'customer' => ['identification' => $defaultCustomerId],
+    'seller' => ['id' => (int)($request->input('seller_id') ?? 1)],
+    'cost_center' => isset($chunk[0]['cost_center']) ? (int)$chunk[0]['cost_center'] : (int)($config->centro_costos_default ?? 0),
+    'items' => $itemsForSiigo,
+    'obs' => $request->input('observations') ?? null,
+];
+
+// payments top-level (si existe paymentId)
+if (!empty($paymentId) && $paymentId > 0) {
+    $totalPayment = 0.0;
+    foreach ($itemsForSiigo as $it) {
+        if (isset($it['account']['movement']) && strtolower($it['account']['movement']) === 'debit') {
+            $totalPayment += (float)($it['value'] ?? 0);
+        }
+    }
+    if ($totalPayment > 0) {
+        $paramsVentas['payments'] = [
+            [
+                'value' => round($totalPayment, 2),
+                'due_date' => $dateManual,
+                'payment_method' => ['id' => (int)$paymentId]
+            ]
+        ];
+    }
+}
+
+
+
 
         $attempt = 0;
         $success = false;
@@ -545,6 +676,7 @@ if (!empty($itemsFacturaVentas)) {
     $iddoc = $params['iddoc'] ?? null;
     if (!$iddoc) return response()->json(['error' => 'iddoc required'], 400);
 
+
     $operacion = $params['_id'] ?? ($params['folio'] ?? null);
     if (!$operacion) {
         return response()->json(['error' => 'Folio o _id requerido para control interno'], 400);
@@ -590,19 +722,45 @@ if (!empty($itemsFacturaVentas)) {
 
         $token = $this->siigoAuth($params['user'] ?? $config->siigo_user, $params['key'] ?? $config->siigo_key);
 
+                // --- antes: $payload = [...]
+        // Construir items desde 'data' ó 'items' (compatibilidad con ambos formatos)
+        $items = [];
+        if (isset($params['data']) && is_array($params['data'])) {
+            $items = $params['data'];
+        } elseif (isset($params['items']) && is_array($params['items'])) {
+            $items = $params['items'];
+        }
+
+        // Base del payload (aseguramos document.id)
         $payload = [
             'document' => ['id' => (int)$iddoc],
             'date' => $params['date'] ?? now()->format('Y-m-d'),
-            'items' => $params['data'] ?? [],
-            'observations' => $params['obs'] ?? null,
+            'items' => $items,
         ];
 
-        if (!is_null($consecutivo) && $reserveNumberFlag) {
-            $payload['number'] = $consecutivo;
-        } elseif ($explicitNumber !== null) {
-            $payload['number'] = $explicitNumber;
-        } else {
-            if (isset($payload['number'])) unset($payload['number']);
+        // Passthrough de algunos campos top-level opcionales que usan las ventas
+        // (mantener otros formatos funcionando: customer, seller, payments, cost_center)
+        if (isset($params['obs']) && !isset($payload['observations'])) {
+            $payload['observations'] = $params['obs'];
+        }
+        if (isset($params['observations'])) {
+            $payload['observations'] = $params['observations'];
+        }
+        if (isset($params['customer'])) {
+            $payload['customer'] = $params['customer'];
+        }
+        if (isset($params['seller'])) {
+            $payload['seller'] = $params['seller'];
+        }
+        if (isset($params['payments'])) {
+            $payload['payments'] = $params['payments'];
+        }
+        if (isset($params['cost_center'])) {
+            $payload['cost_center'] = $params['cost_center'];
+        }
+        // si el caller proveyó un 'number' explícito, lo respetamos
+        if (isset($params['number'])) {
+            $payload['number'] = $params['number'];
         }
 
         Log::info('sendComprobanteSiigo -> payload prepared', [
@@ -617,8 +775,10 @@ if (!empty($itemsFacturaVentas)) {
 
         // POST con reintentos para 5xx / timeouts
         $client = new GuzzleClient();
-        $maxAttempts = 4;
+        // Aumentado a 10 intentos para que 'documents_service' pueda reintentarse hasta 10 veces.
+        $maxAttempts = 10;
         $lastException = null;
+
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             try {
@@ -644,35 +804,68 @@ if (!empty($itemsFacturaVentas)) {
                 return response()->json($body, $status);
 
             } catch (RequestException $re) {
-                $lastException = $re;
-                $status = $re->hasResponse() ? $re->getResponse()->getStatusCode() : 0;
-                $body = $re->hasResponse() ? (string)$re->getResponse()->getBody() : $re->getMessage();
+    $lastException = $re;
+    $status = $re->hasResponse() ? $re->getResponse()->getStatusCode() : 0;
+    $bodyStr = $re->hasResponse() ? (string)$re->getResponse()->getBody() : $re->getMessage();
 
-                Log::warning("sendComprobanteSiigo -> attempt {$attempt} failed (status {$status}) for operacion {$operacion}", [
-                    'body' => $body
-                ]);
+    // Intentamos decodificar JSON (si aplica). Si no es JSON, guardamos el string.
+    $bodyDecoded = json_decode($bodyStr, true);
+    if ($bodyDecoded === null) {
+        // json_decode devuelve null tanto para JSON null como para fallo, pero Siigo nunca retornará "null" puro;
+        // así que en caso de null usamos el string original.
+        $bodyDecoded = $bodyStr;
+    }
 
-                // reintentar para 5xx o sin status (network issues)
-                if ($status >= 500 || $status === 0) {
-                    if ($attempt < $maxAttempts) {
-                        // exponential backoff
-                        $sleep = pow(2, $attempt);
-                        Log::info("sendComprobanteSiigo -> sleeping {$sleep}s before retry (attempt {$attempt})");
-                        sleep($sleep);
-                        continue;
-                    } else {
-                        // devolver el error con el status real (o 503/500 si no disponible)
-                        $outStatus = $status ?: 503;
-                        $decoded = json_decode($body, true);
-                        return response()->json($decoded ?: $body, $outStatus);
-                    }
-                } else {
-                    // error no reintenteable (4xx) -> devolver inmediatamente
-                    $decoded = json_decode($body, true);
-                    $outStatus = $status ?: 400;
-                    return response()->json($decoded ?: $body, $outStatus);
-                }
-            } catch (Exception $e) {
+    Log::warning("sendComprobanteSiigo -> attempt {$attempt} RequestException (status {$status})", [
+        'operacion' => $operacion,
+        'body' => $bodyDecoded
+    ]);
+
+    // --- Caso especial: Siigo devuelve 400 con Errors[] y Code == 'documents_service'
+    if ($status === 400 && is_array($bodyDecoded) && isset($bodyDecoded['Errors']) && is_array($bodyDecoded['Errors'])) {
+        $hasDocsService = false;
+        foreach ($bodyDecoded['Errors'] as $err) {
+            if (isset($err['Code']) && $err['Code'] === 'documents_service') {
+                $hasDocsService = true;
+                break;
+            }
+        }
+
+        if ($hasDocsService) {
+            Log::warning("sendComprobanteSiigo -> documents_service detected (attempt {$attempt}) for operacion {$operacion}");
+            if ($attempt < $maxAttempts) {
+                // backoff con tope razonable
+                $sleep = min(60, pow(2, $attempt));
+                sleep($sleep);
+                continue; // reintentar
+            } else {
+                // agotados intentos: persistir/retornar el body decodificado tal cual
+                return response()->json($bodyDecoded, $status);
+            }
+        }
+
+        // si no es documents_service, devolvemos el 400 al caller (no reintentar)
+        return response()->json($bodyDecoded, $status);
+    }
+
+    // --- reintentar para 5xx, timeouts o rate-limit
+    if ($status >= 500 || $status === 0 || in_array($status, [408, 429])) {
+        if ($attempt < $maxAttempts) {
+            $sleep = min(60, pow(2, $attempt));
+            Log::info("sendComprobanteSiigo -> sleeping {$sleep}s before retry (attempt {$attempt})");
+            sleep($sleep);
+            continue;
+        } else {
+            $outStatus = $status ?: 503;
+            return response()->json(is_array($bodyDecoded) ? $bodyDecoded : $bodyStr, $outStatus);
+        }
+    }
+
+    // --- otros 4xx no reintentables: devolver inmediatamente con cuerpo decodificado si es posible
+    $outStatus = $status ?: 400;
+    return response()->json(is_array($bodyDecoded) ? $bodyDecoded : $bodyStr, $outStatus);
+}
+ catch (Exception $e) {
                 $lastException = $e;
                 Log::error("sendComprobanteSiigo unexpected error on attempt {$attempt}: ".$e->getMessage());
                 if ($attempt < $maxAttempts) {
