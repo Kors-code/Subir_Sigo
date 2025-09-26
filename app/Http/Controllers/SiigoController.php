@@ -170,35 +170,7 @@ public function uploadExcel(Request $request)
         $dta2['account'] = ['code' => $creditAcc, 'movement' => 'Credit'];
         $itemsContable[] = $dta2;
 
-        $itemsFacturaVentas[] = [
-            'account' => ['code' => $ventaAcc, 'movement' => 'Credit'],
-            'customer' => ['identification' => $defaultCustomerId],
-            'cost_center' => (int)$cost_center,
-            'product' => [
-                'code' => (string)$clas,
-                'name' => $r['Detalle'],
-                'quantity' => 0,
-                'description' => $r['Detalle'],
-                'value' => (float)($r['COP'] ?? 0),
-
-            ],
-            'description' => $r['Detalle'],
-            'value' => (float)($r['COP'] ?? 0),
-        ];
-
-        $itemsFacturaVentas[] = [
-            'account' => ['code' => '13050501', 'movement' => 'Debit'],
-            'customer' => ['identification' => $defaultCustomerId],
-            'due' => [
-                'prefix' => 'C',
-                'consecutive' => 1,
-                'quote' => 1,
-                'date' => $dateManual,
-            ],
-            'description' => $r['Detalle'],
-            'cost_center' => (int)$cost_center,
-            'value' => (float)($r['COP'] ?? 0),
-        ];
+        
 
 
         // --- versión alternativa más clara (igual que arriba, pero sin duplicar arrays)
@@ -260,6 +232,7 @@ if (!empty($itemsContable)) {
         $paramsContable = [
             'user' => $config->siigo_user,
             'key'  => $config->siigo_key,
+            'token'=> $token,              
             'data' => $chunk,
             'date' => $dateManual,
             'obs'  => $request->input('observations') ?? null,
@@ -377,8 +350,8 @@ foreach ($chunk as $rawItem) {
                 'code' => (string)($prod['code'] ?? ''),
                 'name' => $prod['name'] ?? ($rawItem['description'] ?? 'Item'),
                 'quantity' => $quantity,
-                // enviamos unitario en product.value (si tu integración necesita unitario)
                 'value' => round($unitValue, 2),
+                'description' => $prod['description'] ?? ($rawItem['description'] ?? 'Item'),
             ],
             // este es el total de la línea
             'value' => $lineTotal,
@@ -422,6 +395,7 @@ Log::info("sendVentas chunk {$i} totals -> credit: {$totalCredit}, debit: {$tota
 $paramsVentas = [
     'iddoc' => 31800,
     '_id' => $chunkOperationId,
+     'token'=> $token, 
     'reserve_number' => false,
     'document' => ['id' => 31800],
     'date' => $dateManual,
@@ -473,15 +447,44 @@ if (!empty($paymentId) && $paymentId > 0) {
                     break;
                 }
 
-                if ($status >= 500) {
+                if ($status >= 500 || in_array($status, [408, 429, 0])) {
                     if ($attempt <= $maxChunkRetries) {
-                        $sleep = pow(2, $attempt);
-                        Log::warning("sendVentas chunk {$i} got {$status}, sleeping {$sleep}s then retrying (attempt {$attempt})");
-                        sleep($sleep);
+                        // si es 429, intentar parsear segundos de "Try again in N seconds" desde el body
+                        $wait = null;
+                        $decodedBody = null;
+                        try { $decodedBody = json_decode($body, true); } catch (\Throwable $t) { $decodedBody = null; }
+
+                        if ($status === 429) {
+                            // heurística: si vienen Errors[].Message con "Try again in N seconds"
+                            if (is_array($decodedBody) && isset($decodedBody['Errors']) && is_array($decodedBody['Errors'])) {
+                                foreach ($decodedBody['Errors'] as $err) {
+                                    if (!empty($err['Message']) && preg_match('/(\d+)\s*second/i', $err['Message'], $m)) {
+                                        $wait = (int)$m[1];
+                                        break;
+                                    }
+                                }
+                            }
+                            // si no conseguimos parsear, esperar 2 segundos mínimo
+                            if ($wait === null) $wait = 2;
+                        }
+
+                        if ($wait === null) {
+                            // backoff exponencial + jitter
+                            $base = pow(2, $attempt);
+                            $jitter = rand(0,2);
+                            $wait = min(60, $base + $jitter);
+                        } else {
+                            // sumar jitter pequeño
+                            $wait = min(60, $wait + rand(0,2));
+                        }
+
+                        Log::warning("sendVentas chunk {$i} got status {$status}, sleeping {$wait}s then retrying (attempt {$attempt})");
+                        sleep($wait);
                         continue;
                     }
                 }
-                break;
+
+
 
             } catch (Exception $e) {
                 Log::error("sendVentas chunk {$i} attempt {$attempt} exception: ".$e->getMessage());
@@ -682,6 +685,7 @@ if (!empty($paymentId) && $paymentId > 0) {
         return response()->json(['error' => 'Folio o _id requerido para control interno'], 400);
     }
 
+
     DB::beginTransaction();
     try {
         $config = Config::lockForUpdate()->first();
@@ -720,7 +724,11 @@ if (!empty($paymentId) && $paymentId > 0) {
 
         DB::commit();
 
-        $token = $this->siigoAuth($params['user'] ?? $config->siigo_user, $params['key'] ?? $config->siigo_key);
+// usar token pasado en params si está (evita múltiples autentications); si no, auth una vez
+        $token = $params['token'] ?? null;
+        if (empty($token)) {
+            $token = $this->siigoAuth($params['user'] ?? $config->siigo_user, $params['key'] ?? $config->siigo_key);
+        }
 
                 // --- antes: $payload = [...]
         // Construir items desde 'data' ó 'items' (compatibilidad con ambos formatos)
@@ -774,113 +782,121 @@ if (!empty($paymentId) && $paymentId > 0) {
         Log::info('Siigo - payload before send', ['payload' => $payload]);
 
         // POST con reintentos para 5xx / timeouts
-        $client = new GuzzleClient();
-        // Aumentado a 10 intentos para que 'documents_service' pueda reintentarse hasta 10 veces.
-        $maxAttempts = 10;
-        $lastException = null;
+       // POST con reintentos hasta obtener status 200 (o agotar intentos)
+$client = new GuzzleClient(['timeout' => 30, 'connect_timeout' => 10]);
+$maxAttempts = 20;
+$lastStatus = null;
+$lastBody = null;
 
+for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+    try {
+        Log::info("sendComprobanteSiigo -> attempt {$attempt} for operacion {$operacion}");
 
-        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        $resp = $client->post('https://api.siigo.com/v1/journals', [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'Partner-ID' => 'DutyFreeCol',
+                'Authorization' => 'Bearer '.$token,
+                'Accept' => 'application/json',
+            ],
+            'json' => $payload,
+            'http_errors' => true,
+            // timeout ya configurado en el cliente
+        ]);
+
+        $status = $resp->getStatusCode();
+        $body = (string)$resp->getBody();
+        $decodedBody = json_decode($body, true) ?: $body;
+
+        $lastStatus = $status;
+        $lastBody = $decodedBody;
+
+        Log::info("sendComprobanteSiigo -> got status {$status} for operacion {$operacion}", ['body' => $decodedBody]);
+
+        // Opcional: tratar 201 también como éxito si tu API devuelve 201 para created
+        if ($status === 200 || $status === 201) {
+            return response()->json(is_array($decodedBody) ? $decodedBody : $body, $status);
+        }
+
+        // 409: si lo quieres tratar como éxito idempotente (ya existe)
+        if ($status === 409) {
+            Log::info("sendComprobanteSiigo -> 409 treated as idempotent success for operacion {$operacion}", ['body' => $decodedBody]);
+            // persistir registro si hace falta
             try {
-                Log::info("sendComprobanteSiigo -> attempt {$attempt} for operacion {$operacion}");
-                $resp = $client->post('https://api.siigo.com/v1/journals', [
-                    'headers' => [
-                        'Content-Type' => 'application/json',
-                        'Partner-ID' => 'DutyFreeCol',
-                        'Authorization' => 'Bearer '.$token,
-                        'Accept' => 'application/json'
-                    ],
-                    'json' => $payload,
-                    'http_errors' => true,
-                    'timeout' => 30,
-                    'connect_timeout' => 10,
-                ]);
-
-                $status = $resp->getStatusCode();
-                $body = json_decode((string)$resp->getBody(), true) ?: (string)$resp->getBody();
-
-                Log::info("sendComprobanteSiigo -> success status {$status} for operacion {$operacion}", ['body'=>$body]);
-
-                return response()->json($body, $status);
-
-            } catch (RequestException $re) {
-    $lastException = $re;
-    $status = $re->hasResponse() ? $re->getResponse()->getStatusCode() : 0;
-    $bodyStr = $re->hasResponse() ? (string)$re->getResponse()->getBody() : $re->getMessage();
-
-    // Intentamos decodificar JSON (si aplica). Si no es JSON, guardamos el string.
-    $bodyDecoded = json_decode($bodyStr, true);
-    if ($bodyDecoded === null) {
-        // json_decode devuelve null tanto para JSON null como para fallo, pero Siigo nunca retornará "null" puro;
-        // así que en caso de null usamos el string original.
-        $bodyDecoded = $bodyStr;
-    }
-
-    Log::warning("sendComprobanteSiigo -> attempt {$attempt} RequestException (status {$status})", [
-        'operacion' => $operacion,
-        'body' => $bodyDecoded
-    ]);
-
-    // --- Caso especial: Siigo devuelve 400 con Errors[] y Code == 'documents_service'
-    if ($status === 400 && is_array($bodyDecoded) && isset($bodyDecoded['Errors']) && is_array($bodyDecoded['Errors'])) {
-        $hasDocsService = false;
-        foreach ($bodyDecoded['Errors'] as $err) {
-            if (isset($err['Code']) && $err['Code'] === 'documents_service') {
-                $hasDocsService = true;
-                break;
+                ComprobanteSiigo::firstOrCreate(
+                    ['operacion' => $operacion],
+                    ['data' => $decodedBody, 'usuario' => $params['user'] ?? $config->siigo_user]
+                );
+            } catch (\Throwable $t) {
+                Log::error("Error guardando ComprobanteSiigo 409: ".$t->getMessage());
             }
+            return response()->json(is_array($decodedBody) ? $decodedBody : $body, 200);
         }
 
-        if ($hasDocsService) {
-            Log::warning("sendComprobanteSiigo -> documents_service detected (attempt {$attempt}) for operacion {$operacion}");
-            if ($attempt < $maxAttempts) {
-                // backoff con tope razonable
-                $sleep = min(60, pow(2, $attempt));
-                sleep($sleep);
-                continue; // reintentar
-            } else {
-                // agotados intentos: persistir/retornar el body decodificado tal cual
-                return response()->json($bodyDecoded, $status);
-            }
-        }
-
-        // si no es documents_service, devolvemos el 400 al caller (no reintentar)
-        return response()->json($bodyDecoded, $status);
-    }
-
-    // --- reintentar para 5xx, timeouts o rate-limit
-    if ($status >= 500 || $status === 0 || in_array($status, [408, 429])) {
+        // Si no es 200/201/409 se considera "no success" -> reintentar si quedan intentos
         if ($attempt < $maxAttempts) {
-            $sleep = min(60, pow(2, $attempt));
-            Log::info("sendComprobanteSiigo -> sleeping {$sleep}s before retry (attempt {$attempt})");
+            $sleep = min(60, pow(2, $attempt)) + rand(0,2);
+            Log::warning("sendComprobanteSiigo -> non-200 status {$status}, sleeping {$sleep}s then retrying (attempt {$attempt})", ['body'=>$decodedBody]);
             sleep($sleep);
             continue;
         } else {
+            // agotados intentos -> devolver último estado al caller
             $outStatus = $status ?: 503;
-            return response()->json(is_array($bodyDecoded) ? $bodyDecoded : $bodyStr, $outStatus);
+            return response()->json(is_array($decodedBody) ? $decodedBody : $body, $outStatus);
         }
-    }
 
-    // --- otros 4xx no reintentables: devolver inmediatamente con cuerpo decodificado si es posible
-    $outStatus = $status ?: 400;
-    return response()->json(is_array($bodyDecoded) ? $bodyDecoded : $bodyStr, $outStatus);
-}
- catch (Exception $e) {
-                $lastException = $e;
-                Log::error("sendComprobanteSiigo unexpected error on attempt {$attempt}: ".$e->getMessage());
-                if ($attempt < $maxAttempts) {
-                    sleep(pow(2, $attempt));
-                    continue;
-                } else {
-                    return response()->json(['error' => $e->getMessage()], 500);
-                }
+    } catch (RequestException $re) {
+        // extraer status/body si la respuesta existe
+        $status = $re->hasResponse() ? $re->getResponse()->getStatusCode() : 0;
+        $bodyStr = $re->hasResponse() ? (string)$re->getResponse()->getBody() : $re->getMessage();
+        $decodedBody = json_decode($bodyStr, true) ?: $bodyStr;
+
+        $lastStatus = $status;
+        $lastBody = $decodedBody;
+
+        Log::warning("sendComprobanteSiigo -> RequestException on attempt {$attempt} (status {$status})", ['operacion'=>$operacion, 'body' => $decodedBody]);
+
+        // Tratar 409 como success idempotente
+        if ($status === 409) {
+            try {
+                ComprobanteSiigo::firstOrCreate(
+                    ['operacion' => $operacion],
+                    ['data' => $decodedBody, 'usuario' => $params['user'] ?? $config->siigo_user]
+                );
+            } catch (\Throwable $t) {
+                Log::error("Error guardando ComprobanteSiigo 409: ".$t->getMessage());
             }
+            return response()->json(is_array($decodedBody) ? $decodedBody : $bodyStr, 200);
         }
 
-        // si cae fuera del loop
-        $msg = $lastException ? $lastException->getMessage() : 'Unknown error';
-        Log::error('sendComprobanteSiigo final failure: '.$msg);
-        return response()->json(['error' => $msg], 500);
+        // reintentar siempre que queden intentos
+        if ($attempt < $maxAttempts) {
+            $sleep = min(60, pow(2, $attempt)) + rand(0,2);
+            Log::info("sendComprobanteSiigo -> sleeping {$sleep}s before retry after RequestException (attempt {$attempt})");
+            sleep($sleep);
+            continue;
+        } else {
+            // agotados intentos -> devolver último cuerpo/status
+            $outStatus = $status ?: 503;
+            return response()->json(is_array($decodedBody) ? $decodedBody : $bodyStr, $outStatus);
+        }
+
+    } catch (Exception $e) {
+        Log::error("sendComprobanteSiigo unexpected error on attempt {$attempt}: ".$e->getMessage());
+        $lastBody = $e->getMessage();
+        if ($attempt < $maxAttempts) {
+            sleep(min(60, pow(2, $attempt)));
+            continue;
+        }
+        return response()->json(['error' => $e->getMessage()], 500);
+    }
+}
+
+// si llega aquí, devolvemos el último resultado conocido
+$outStatus = $lastStatus ?: 500;
+return response()->json($lastBody ?: ['error' => 'final failure'], $outStatus);
+
+        
 
     } catch (Exception $e) {
         DB::rollBack();
@@ -1165,9 +1181,11 @@ if (!empty($paymentId) && $paymentId > 0) {
             }
             return $body['access_token'];
         } catch (RequestException $re) {
-            $msg = $re->hasResponse() ? (string)$re->getResponse()->getBody() : $re->getMessage();
-            Log::error('siigoAuth RequestException: '.$msg);
-            throw new Exception($msg);
+             $status = $re->hasResponse() ? $re->getResponse()->getStatusCode() : 0;
+            $body = $re->hasResponse() ? (string)$re->getResponse()->getBody() : $re->getMessage();
+            Log::error('siigoAuth RequestException: '.$body);
+            // lanzar excepción con mensaje y código (para que el caller pueda devolver el mismo status)
+            throw new \Exception($body, $status);
         }
     }
 
